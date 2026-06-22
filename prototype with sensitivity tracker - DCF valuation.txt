@@ -1,0 +1,339 @@
+"""
+DCF Valuation Prototype — Live Data Fetcher
+=============================================
+Pulls live financials for a list of tickers via yfinance (free, no API key)
+and writes them into an Excel workbook with a full DCF model (formulas, not
+hardcoded values) for each company, plus a comparison summary tab.
+
+Run locally (not inside Claude's sandbox — that has no internet access to
+finance APIs):
+
+    pip install yfinance openpyxl
+    python dcf_data_fetcher.py
+
+Edit TICKERS below to change which companies are modeled.
+"""
+
+import yfinance as yf
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+TICKERS = ["AAPL", "MSFT", "GOOGL"]
+
+# DCF assumptions per ticker (edit freely — these aren't available from
+# yfinance and require analyst judgement)
+ASSUMPTIONS = {
+    "AAPL":  {"growth": 0.07, "wacc": 0.09,  "terminal_g": 0.03},
+    "MSFT":  {"growth": 0.12, "wacc": 0.085, "terminal_g": 0.035},
+    "GOOGL": {"growth": 0.13, "wacc": 0.09,  "terminal_g": 0.035},
+}
+DEFAULT_ASSUMPTIONS = {"growth": 0.08, "wacc": 0.09, "terminal_g": 0.03}
+
+
+def fetch_company_data(ticker: str) -> dict:
+    """Pull the inputs a DCF needs from yfinance."""
+    t = yf.Ticker(ticker)
+    info = t.info
+    cashflow = t.cashflow  # annual cash flow statement (most recent column first)
+    balance = t.balance_sheet
+
+    # Free cash flow = Operating Cash Flow - CapEx (most recent fiscal year)
+    try:
+        ocf = cashflow.loc["Operating Cash Flow"].iloc[0]
+        capex = cashflow.loc["Capital Expenditure"].iloc[0]
+        fcf = ocf + capex  # capex is stored as a negative number
+    except Exception:
+        fcf = info.get("freeCashflow", 0)
+
+    cash = info.get("totalCash", 0)
+    debt = info.get("totalDebt", 0)
+    shares = info.get("sharesOutstanding", 0)
+    price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+    revenue = info.get("totalRevenue", 0)
+    name = info.get("longName", ticker)
+
+    return {
+        "ticker": ticker, "name": name,
+        "revenue": revenue / 1e6, "fcf": fcf / 1e6,
+        "shares": shares / 1e6, "cash": cash / 1e6, "debt": debt / 1e6,
+        "price": price,
+        **ASSUMPTIONS.get(ticker, DEFAULT_ASSUMPTIONS),
+        "source": f"Source: yfinance (Yahoo Finance), live pull",
+    }
+
+
+# ---------------------------------------------------------------
+# Styling (matches the prototype workbook conventions)
+# ---------------------------------------------------------------
+FONT = "Arial"
+BLUE = Font(name=FONT, color="0000FF")
+BLACK = Font(name=FONT, color="000000")
+GREEN = Font(name=FONT, color="008000")
+BOLD = Font(name=FONT, bold=True)
+BOLD_BLACK = Font(name=FONT, bold=True, color="000000")
+TITLE_FONT = Font(name=FONT, bold=True, size=14)
+SUBTLE = Font(name=FONT, italic=True, size=9, color="666666")
+HEADER_FILL = PatternFill("solid", start_color="1F4E78")
+HEADER_FONT = Font(name=FONT, bold=True, color="FFFFFF")
+SECTION_FILL = PatternFill("solid", start_color="D9E1F2")
+YELLOW = PatternFill("solid", start_color="FFFF00")
+THIN = Side(style="thin", color="BFBFBF")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+NUM0 = "$#,##0;($#,##0);\"-\""
+NUM2 = "$#,##0.00;($#,##0.00);\"-\""
+PCT1 = "0.0%"
+
+
+def style_header_row(ws, row, n_cols):
+    for c in range(1, n_cols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.border = BORDER
+
+
+def build_company_sheet(wb, comp):
+    ws = wb.create_sheet(comp["ticker"])
+    ws["A1"] = f"{comp['name']} ({comp['ticker']}) — DCF Valuation"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:F1")
+    ws["A2"] = "5-year FCF projection, discounted to present value, plus terminal value (Gordon Growth)."
+    ws["A2"].font = SUBTLE
+    ws.merge_cells("A2:F2")
+
+    ws["A4"] = "Inputs"
+    ws["A4"].font = BOLD
+    ws["A4"].fill = SECTION_FILL
+    ws.merge_cells("A4:B4")
+
+    inputs = [
+        ("Base year Free Cash Flow ($mm)", comp["fcf"], NUM0),
+        ("Base year Revenue ($mm)", comp["revenue"], NUM0),
+        ("FCF growth rate (Yrs 1-5)", comp["growth"], PCT1),
+        ("Discount rate / WACC", comp["wacc"], PCT1),
+        ("Terminal growth rate", comp["terminal_g"], PCT1),
+        ("Cash & equivalents ($mm)", comp["cash"], NUM0),
+        ("Total debt ($mm)", comp["debt"], NUM0),
+        ("Diluted shares outstanding (mm)", comp["shares"], "#,##0"),
+        ("Current share price ($)", comp["price"], NUM2),
+    ]
+    r = 5
+    for label, val, fmt in inputs:
+        ws.cell(row=r, column=1, value=label).font = BLACK
+        c = ws.cell(row=r, column=2, value=val)
+        c.font = BLUE
+        c.number_format = fmt
+        c.fill = YELLOW
+        c.border = BORDER
+        r += 1
+    ws.cell(row=r, column=1, value=comp["source"]).font = SUBTLE
+    ws.merge_cells(f"A{r}:F{r}")
+
+    fcf_row, rev_row, g_row, wacc_row, tg_row, cash_row, debt_row, shares_row, price_row = range(5, 14)
+
+    proj_header_row = r + 2
+    headers = ["Year", "Period (t)", "Projected FCF ($mm)", "Discount Factor", "PV of FCF ($mm)"]
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=proj_header_row, column=i, value=h)
+    style_header_row(ws, proj_header_row, len(headers))
+
+    start_row = proj_header_row + 1
+    for t in range(1, 6):
+        rr = start_row + t - 1
+        ws.cell(row=rr, column=1, value=f"Year {t}").font = BLACK
+        ws.cell(row=rr, column=2, value=t).font = BLACK
+        ws.cell(row=rr, column=2).number_format = "0"
+        if t == 1:
+            fcf_formula = f"=$B${fcf_row}*(1+$B${g_row})"
+        else:
+            fcf_formula = f"=C{rr-1}*(1+$B${g_row})"
+        ws.cell(row=rr, column=3, value=fcf_formula).font = BLACK
+        ws.cell(row=rr, column=3).number_format = NUM0
+        ws.cell(row=rr, column=4, value=f"=1/(1+$B${wacc_row})^B{rr}").font = BLACK
+        ws.cell(row=rr, column=4).number_format = "0.000"
+        ws.cell(row=rr, column=5, value=f"=C{rr}*D{rr}").font = BLACK
+        ws.cell(row=rr, column=5).number_format = NUM0
+        for col in range(1, 6):
+            ws.cell(row=rr, column=col).border = BORDER
+
+    end_row = start_row + 4
+
+    tv_row = end_row + 2
+    ws.cell(row=tv_row, column=1, value="Terminal Value (at end of Year 5)").font = BLACK
+    ws.cell(row=tv_row, column=3, value=f"=C{end_row}*(1+$B${tg_row})/($B${wacc_row}-$B${tg_row})").font = BLACK
+    ws.cell(row=tv_row, column=3).number_format = NUM0
+    ws.cell(row=tv_row, column=4, value=f"=D{end_row}").font = BLACK
+    ws.cell(row=tv_row, column=4).number_format = "0.000"
+    ws.cell(row=tv_row, column=5, value=f"=C{tv_row}*D{tv_row}").font = BLACK
+    ws.cell(row=tv_row, column=5).number_format = NUM0
+    for col in range(1, 6):
+        ws.cell(row=tv_row, column=col).border = BORDER
+
+    sum_row = tv_row + 2
+    ws.cell(row=sum_row, column=1, value="Valuation Summary").font = BOLD
+    ws.cell(row=sum_row, column=1).fill = SECTION_FILL
+    ws.merge_cells(f"A{sum_row}:B{sum_row}")
+
+    rows_summary = [
+        ("Sum of PV of 5-yr FCF ($mm)", f"=SUM(E{start_row}:E{end_row})", NUM0),
+        ("PV of Terminal Value ($mm)", f"=E{tv_row}", NUM0),
+        ("Enterprise Value ($mm)", None, NUM0),
+        ("Less: Total Debt ($mm)", f"=-B{debt_row}", NUM0),
+        ("Add: Cash & Equivalents ($mm)", f"=B{cash_row}", NUM0),
+        ("Equity Value ($mm)", None, NUM0),
+        ("Diluted Shares Outstanding (mm)", f"=B{shares_row}", "#,##0"),
+        ("Intrinsic Value per Share ($)", None, NUM2),
+        ("Current Share Price ($)", f"=B{price_row}", NUM2),
+        ("Upside / (Downside) to Intrinsic Value", None, PCT1),
+    ]
+    rs = sum_row + 1
+    label_rows = {}
+    for label, formula, fmt in rows_summary:
+        ws.cell(row=rs, column=1, value=label).font = BLACK
+        cell = ws.cell(row=rs, column=2)
+        cell.number_format = fmt
+        cell.border = BORDER
+        ws.cell(row=rs, column=1).border = BORDER
+        label_rows[label] = rs
+        if formula:
+            cell.value = formula
+            cell.font = BLACK
+        rs += 1
+
+    pv_fcf_r = label_rows["Sum of PV of 5-yr FCF ($mm)"]
+    pv_tv_r = label_rows["PV of Terminal Value ($mm)"]
+    ev_r = label_rows["Enterprise Value ($mm)"]
+    debt_r2 = label_rows["Less: Total Debt ($mm)"]
+    cash_r2 = label_rows["Add: Cash & Equivalents ($mm)"]
+    eqv_r = label_rows["Equity Value ($mm)"]
+    shares_r2 = label_rows["Diluted Shares Outstanding (mm)"]
+    ivps_r = label_rows["Intrinsic Value per Share ($)"]
+    price_r2 = label_rows["Current Share Price ($)"]
+    upside_r = label_rows["Upside / (Downside) to Intrinsic Value"]
+
+    ws.cell(row=ev_r, column=2, value=f"=B{pv_fcf_r}+B{pv_tv_r}").font = BOLD_BLACK
+    ws.cell(row=eqv_r, column=2, value=f"=B{ev_r}+B{debt_r2}+B{cash_r2}").font = BOLD_BLACK
+    ws.cell(row=ivps_r, column=2, value=f"=(B{eqv_r}*1)/B{shares_r2}").font = BOLD_BLACK
+    ws.cell(row=upside_r, column=2, value=f"=B{ivps_r}/B{price_r2}-1").font = BOLD_BLACK
+
+    # --- Sensitivity table: Intrinsic Value/Share vs WACC and Terminal Growth ---
+    sens_title_row = upside_r + 2
+    ws.cell(row=sens_title_row, column=1,
+            value="Sensitivity: Intrinsic Value per Share ($)").font = BOLD
+    ws.cell(row=sens_title_row, column=1).fill = SECTION_FILL
+    ws.merge_cells(f"A{sens_title_row}:F{sens_title_row}")
+    ws.cell(row=sens_title_row + 1, column=1,
+            value="Rows = WACC, Columns = Terminal growth rate. Edit the blue axis values to widen/narrow the range.").font = SUBTLE
+    ws.merge_cells(f"A{sens_title_row+1}:F{sens_title_row+1}")
+
+    header_row = sens_title_row + 3
+    corner_label_row = header_row - 1
+    ws.cell(row=corner_label_row, column=1, value="WACC \\ Terminal g").font = SUBTLE
+
+    wacc_base = comp["wacc"]
+    tg_base = comp["terminal_g"]
+    step = 0.005  # 0.5 percentage point steps
+    wacc_vals = [wacc_base + s * step for s in (-2, -1, 0, 1, 2)]
+    tg_vals = [tg_base + s * step for s in (-2, -1, 0, 1, 2)]
+
+    # column headers (terminal growth values) across row `header_row`, cols B..F
+    for j, tg in enumerate(tg_vals):
+        col = 2 + j  # B=2
+        c = ws.cell(row=header_row, column=col, value=tg)
+        c.font = BLUE
+        c.number_format = PCT1
+        c.fill = YELLOW
+        c.border = BORDER
+        c.alignment = Alignment(horizontal="center")
+
+    # row headers (WACC values) down col A, rows header_row+1..+5, and grid formulas
+    for i, wacc in enumerate(wacc_vals):
+        row = header_row + 1 + i
+        rc = ws.cell(row=row, column=1, value=wacc)
+        rc.font = BLUE
+        rc.number_format = PCT1
+        rc.fill = YELLOW
+        rc.border = BORDER
+        for j, tg in enumerate(tg_vals):
+            col = 2 + j
+            col_letter = get_column_letter(col)
+            formula = (
+                f"=(SUMPRODUCT($B${fcf_row}*(1+$B${g_row})^{{1,2,3,4,5}},"
+                f"(1+$A{row})^-{{1,2,3,4,5}})"
+                f"+($B${fcf_row}*(1+$B${g_row})^5*(1+{col_letter}${header_row})"
+                f"/($A{row}-{col_letter}${header_row}))*(1+$A{row})^-5"
+                f"-$B${debt_row}+$B${cash_row})/$B${shares_row}"
+            )
+            cell = ws.cell(row=row, column=col, value=formula)
+            cell.font = BLACK
+            cell.number_format = NUM2
+            cell.border = BORDER
+
+    sens_end_row = header_row + 5
+
+    widths = {"A": 36, "B": 16, "C": 18, "D": 16, "E": 16, "F": 14}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    return {"ws_name": comp["ticker"], "ivps_row": ivps_r, "price_row": price_r2,
+            "upside_row": upside_r, "ev_row": ev_r, "eqv_row": eqv_r,
+            "sens_header_row": header_row, "sens_end_row": sens_end_row}
+
+
+def build_summary_sheet(wb, refs):
+    ws = wb.create_sheet("Summary", 0)
+    ws["A1"] = "DCF Valuation — Live Data Comparison"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:G1")
+    ws["A2"] = "Financials pulled live via yfinance. Re-run the script anytime for fresh data."
+    ws["A2"].font = SUBTLE
+    ws.merge_cells("A2:G2")
+
+    headers = ["Company", "Ticker", "Current Price ($)", "Intrinsic Value / Share ($)",
+               "Upside / (Downside)", "Enterprise Value ($mm)", "Equity Value ($mm)"]
+    hr = 4
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=hr, column=i, value=h)
+    style_header_row(ws, hr, len(headers))
+
+    rr = hr + 1
+    for comp, ref in refs:
+        sheet = ref["ws_name"]
+        ws.cell(row=rr, column=1, value=comp["name"]).font = BLACK
+        ws.cell(row=rr, column=2, value=comp["ticker"]).font = BLACK
+        ws.cell(row=rr, column=3, value=f"='{sheet}'!B{ref['price_row']}").font = GREEN
+        ws.cell(row=rr, column=3).number_format = NUM2
+        ws.cell(row=rr, column=4, value=f"='{sheet}'!B{ref['ivps_row']}").font = GREEN
+        ws.cell(row=rr, column=4).number_format = NUM2
+        ws.cell(row=rr, column=5, value=f"='{sheet}'!B{ref['upside_row']}").font = GREEN
+        ws.cell(row=rr, column=5).number_format = PCT1
+        ws.cell(row=rr, column=6, value=f"='{sheet}'!B{ref['ev_row']}").font = GREEN
+        ws.cell(row=rr, column=6).number_format = NUM0
+        ws.cell(row=rr, column=7, value=f"='{sheet}'!B{ref['eqv_row']}").font = GREEN
+        ws.cell(row=rr, column=7).number_format = NUM0
+        for col in range(1, 8):
+            ws.cell(row=rr, column=col).border = BORDER
+        rr += 1
+
+    widths = {"A": 26, "B": 10, "C": 16, "D": 20, "E": 18, "F": 20, "G": 18}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+
+def main():
+    wb = Workbook()
+    wb.remove(wb.active)
+    refs = []
+    for ticker in TICKERS:
+        print(f"Fetching {ticker}...")
+        comp = fetch_company_data(ticker)
+        refs.append((comp, build_company_sheet(wb, comp)))
+    build_summary_sheet(wb, refs)
+    wb.save("dcf_live_output.xlsx")
+    print("Saved dcf_live_output.xlsx")
+
+
+if __name__ == "__main__":
+    main()
